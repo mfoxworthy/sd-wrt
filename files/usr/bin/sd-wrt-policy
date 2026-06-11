@@ -1,0 +1,151 @@
+#!/bin/sh
+# sd-wrt-policy — reads link states and UCI rules, programs nftables marks
+# and ip routing tables. Triggered by SIGUSR1 (from probe) and SIGHUP (UCI change).
+
+. /lib/functions.sh
+
+RUNDIR=/var/run/sd-wrt
+PID_FILE=/var/run/sd-wrt-policy.pid
+
+echo $$ > "$PID_FILE"
+mkdir -p "$RUNDIR"
+
+# ── Routing table setup ───────────────────────────────────────────────────────
+setup_routing_tables() {
+    setup_one_link() {
+        local section="$1"
+        local ifname table
+        config_get ifname "$section" ifname
+        config_get table  "$section" table
+
+        local state
+        state=$(grep '^state=' "$RUNDIR/$section.state" 2>/dev/null | cut -d= -f2)
+        [ "$state" = DOWN ] && return
+
+        local gw
+        gw=$(ubus call network.interface."$section" status 2>/dev/null \
+             | jsonfilter -e '@.route[0].nexthop' 2>/dev/null)
+        [ -z "$gw" ] && return
+
+        ip route replace default via "$gw" dev "$ifname" table "$table" 2>/dev/null
+    }
+    config_foreach setup_one_link link
+}
+
+# ── fwmark → routing table mapping ───────────────────────────────────────────
+apply_ip_rules() {
+    local interactive_section="" default_section=""
+    find_role_sections() {
+        local section role
+        section="$1"
+        config_get role "$section" role
+        [ "$role" = interactive ] && interactive_section="$section"
+        [ "$role" = default ]     && default_section="$section"
+    }
+    config_foreach find_role_sections link
+
+    local int_state def_state int_table def_table int_mark def_mark
+    int_state=$(grep '^state=' "$RUNDIR/$interactive_section.state" 2>/dev/null | cut -d= -f2)
+    def_state=$(grep '^state=' "$RUNDIR/$default_section.state"    2>/dev/null | cut -d= -f2)
+    config_get int_table "$interactive_section" table 101
+    config_get def_table "$default_section"     table 102
+    config_get int_mark  "$interactive_section" fwmark 0x01
+    config_get def_mark  "$default_section"     fwmark 0x02
+
+    local mark_int_table mark_def_table
+    case "$def_state" in
+        DEGRADED|DOWN)
+            mark_int_table=$int_table
+            mark_def_table=$int_table
+            ;;
+        *)
+            case "$int_state" in
+                DEGRADED|DOWN)
+                    mark_int_table=$def_table
+                    mark_def_table=$def_table
+                    ;;
+                *)
+                    mark_int_table=$int_table
+                    mark_def_table=$def_table
+                    ;;
+            esac
+            ;;
+    esac
+
+    ip rule del fwmark "$int_mark" 2>/dev/null
+    ip rule del fwmark "$def_mark" 2>/dev/null
+    ip rule add fwmark "$int_mark" lookup "$mark_int_table" pref 1001
+    ip rule add fwmark "$def_mark" lookup "$mark_def_table" pref 1002
+
+    logger -t sd-wrt-policy \
+        "rules: fwmark $int_mark -> table $mark_int_table, fwmark $def_mark -> table $mark_def_table"
+}
+
+# ── Top-level helpers (ash cannot define functions inside functions) ──────────
+
+emit_nft_rule() {
+    local section="$1"
+    local proto dport dest_ip role mark_val nft_rule=""
+    config_get proto   "$section" proto
+    config_get dport   "$section" dport
+    config_get dest_ip "$section" dest_ip
+    config_get role    "$section" role
+
+    [ "$role" = interactive ] && mark_val="$INT_MARK"
+    [ "$role" = default ]     && mark_val="$DEF_MARK"
+    [ -z "$mark_val" ] && return
+
+    [ -n "$proto" ]   && nft_rule="meta l4proto { $(echo $proto | tr ' ' ',') } "
+    [ -n "$dport" ]   && nft_rule="${nft_rule}th dport { $(echo $dport | tr ' ' ',') } "
+    [ -n "$dest_ip" ] && nft_rule="${nft_rule}ip daddr $dest_ip "
+    nft_rule="${nft_rule}mark set $mark_val"
+    echo "add rule inet sd_wrt prerouting $nft_rule"
+}
+
+fwmark_for_role() {
+    local want_role="$1"
+    local found_mark=""
+    _fw_scan() {
+        local s="$1" r m
+        config_get r "$s" role
+        config_get m "$s" fwmark
+        [ "$r" = "$want_role" ] && found_mark="$m"
+    }
+    config_foreach _fw_scan link
+    echo "$found_mark"
+}
+
+# ── nftables mark rules ───────────────────────────────────────────────────────
+apply_nftables() {
+    INT_MARK=$(fwmark_for_role interactive)
+    DEF_MARK=$(fwmark_for_role default)
+
+    {
+        echo "add table inet sd_wrt"
+        echo "add set inet sd_wrt sdwrt_interactive { type ipv4_addr; flags timeout; }"
+        echo "add chain inet sd_wrt prerouting { type filter hook prerouting priority mangle; policy accept; }"
+        echo "flush chain inet sd_wrt prerouting"
+        echo "add rule inet sd_wrt prerouting ip daddr @sdwrt_interactive mark set $INT_MARK"
+        config_foreach emit_nft_rule rule
+        echo "add rule inet sd_wrt prerouting mark 0x00 mark set $DEF_MARK"
+    } | nft -f -
+}
+
+# ── Full apply ────────────────────────────────────────────────────────────────
+apply_all() {
+    config_load sd-wrt
+    setup_routing_tables
+    apply_ip_rules
+    apply_nftables
+}
+
+# Signal handling: SIGUSR1 = link state change, HUP = UCI config change
+trap 'config_load sd-wrt; apply_ip_rules' USR1
+trap 'apply_all' HUP
+
+apply_all
+
+while true; do
+    sleep 60 &
+    wait $!
+done
