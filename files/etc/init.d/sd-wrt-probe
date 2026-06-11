@@ -1,0 +1,5 @@
+#!/bin/sh /etc/rc.common
+USE_PROCD=1
+START=95
+STOP=5
+start_service() { :; }
