@@ -1,0 +1,79 @@
+#!/bin/sh
+# rpcd backend for luci-app-sd-wrt.
+# Usage: ubus call luci.sd-wrt status
+
+. /lib/functions.sh
+
+RUNDIR=/var/run/sd-wrt
+LOGFILE=/var/log/sd-wrt-events
+
+case "$1" in
+    list)
+        echo '{ "status": {} }'
+        ;;
+    call)
+        case "$2" in
+            status)
+                config_load sd-wrt
+
+                links_json=""
+                emit_link() {
+                    local section="$1"
+                    local ifname table role
+                    config_get ifname  "$section" ifname
+                    config_get table   "$section" table
+                    config_get role    "$section" role
+
+                    local state latency loss
+                    state=$(grep   '^state='   "$RUNDIR/$section.state" 2>/dev/null | cut -d= -f2)
+                    latency=$(grep '^latency=' "$RUNDIR/$section.state" 2>/dev/null | cut -d= -f2)
+                    loss=$(grep    '^loss='    "$RUNDIR/$section.state" 2>/dev/null | cut -d= -f2)
+                    [ -z "$state" ]   && state=UNKNOWN
+                    [ -z "$latency" ] && latency=0
+                    [ -z "$loss" ]    && loss=0
+
+                    [ -n "$links_json" ] && links_json="${links_json},"
+                    links_json="${links_json}\"$section\":{\"state\":\"$state\",\"latency\":$latency,\"loss\":$loss,\"table\":$table,\"role\":\"$role\"}"
+                }
+                config_foreach emit_link link
+
+                local int_link="" def_link="" int_table="" def_table=""
+                find_roles() {
+                    local s="$1" r t
+                    config_get r "$s" role
+                    config_get t "$s" table
+                    [ "$r" = interactive ] && { int_link="$s"; int_table="$t"; }
+                    [ "$r" = default ]     && { def_link="$s"; def_table="$t"; }
+                }
+                config_foreach find_roles link
+
+                local active_int active_def
+                active_int=$(ip rule list | grep "fwmark" | grep "lookup $int_table" | head -1)
+                if echo "$active_int" | grep -q "lookup $int_table"; then
+                    active_int="$int_link"
+                else
+                    active_int="$def_link"
+                fi
+                active_def=$(ip rule list | grep "0x02" | grep -oE 'lookup [0-9]+' | awk '{print $2}')
+                [ "$active_def" = "$int_table" ] && active_def="$int_link" || active_def="$def_link"
+
+                local events_json="" _evt_tmp
+                if [ -f "$LOGFILE" ]; then
+                    # Write to temp file so the while loop runs in the same shell
+                    # (ash piped while-loops are subshells; variable assignments are lost)
+                    _evt_tmp=$(mktemp -t sd-wrt-events.XXXXXX)
+                    tail -10 "$LOGFILE" > "$_evt_tmp"
+                    while IFS= read -r line; do
+                        [ -n "$events_json" ] && events_json="${events_json},"
+                        line_esc=$(echo "$line" | sed 's/"/\\"/g')
+                        events_json="${events_json}\"${line_esc}\""
+                    done < "$_evt_tmp"
+                    rm -f "$_evt_tmp"
+                fi
+
+                printf '{"links":{%s},"active_policy":{"interactive":"%s","default":"%s"},"events":[%s]}\n' \
+                    "$links_json" "$active_int" "$active_def" "$events_json"
+                ;;
+        esac
+        ;;
+esac

@@ -1,0 +1,24 @@
+#!/bin/sh
+# Triggered by netifd on interface up/down. INTERFACE is the netifd name (e.g. wan, cellular).
+
+[ "$ACTION" = ifup ] || exit 0
+
+RUNDIR=/var/run/sd-wrt
+state_file="$RUNDIR/$INTERFACE.state"
+
+# Only act on interfaces we monitor
+[ -f "$state_file" ] || exit 0
+
+# 1. Reset link state to UNKNOWN so probe re-evaluates immediately
+printf 'state=UNKNOWN\nlatency=0\nloss=0\nchanged=%d\n' "$(date +%s)" \
+    > "$state_file.tmp" && mv "$state_file.tmp" "$state_file"
+: > "$RUNDIR/$INTERFACE.bad_count"
+: > "$RUNDIR/$INTERFACE.good_since"
+
+# 2. Signal probe for immediate re-probe
+probe_pid=$(pgrep -f sd-wrt-probe | head -1)
+[ -n "$probe_pid" ] && kill -USR1 "$probe_pid" 2>/dev/null
+
+# 3. Signal policy to rebuild routing tables (netifd has the gateway)
+policy_pid=$(cat /var/run/sd-wrt-policy.pid 2>/dev/null)
+[ -n "$policy_pid" ] && kill -HUP "$policy_pid" 2>/dev/null
