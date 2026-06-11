@@ -1,0 +1,135 @@
+#!/bin/sh
+# sd-wrt-probe — pings each configured WAN link, tracks GOOD/DEGRADED/DOWN state,
+# writes /var/run/sd-wrt/<link>.state, signals sd-wrt-policy on change.
+
+. /lib/functions.sh
+
+RUNDIR=/var/run/sd-wrt
+LOGFILE=/var/log/sd-wrt-events
+POLICY_PID=/var/run/sd-wrt-policy.pid
+
+mkdir -p "$RUNDIR"
+
+# Read globals from UCI
+config_load sd-wrt
+config_get INTERVAL  globals probe_interval   5
+config_get DEG_LAT   globals degrade_latency  500
+config_get DEG_LOSS  globals degrade_loss     10
+config_get DEG_COUNT globals degrade_count    3
+config_get REC_INT   globals recover_interval 30
+config_get REC_LAT   globals recover_latency  200
+config_get REC_LOSS  globals recover_loss     2
+
+signal_policy() {
+    [ -f "$POLICY_PID" ] && kill -USR1 "$(cat $POLICY_PID)" 2>/dev/null
+}
+
+log_event() {
+    local msg
+    msg="$(date '+%Y-%m-%d %H:%M:%S')  $1"
+    echo "$msg" >> "$LOGFILE"
+    # Ring-cap at 20 lines
+    local lines
+    lines=$(wc -l < "$LOGFILE" 2>/dev/null || echo 0)
+    if [ "$lines" -gt 20 ]; then
+        tail -20 "$LOGFILE" > "$LOGFILE.tmp" && mv "$LOGFILE.tmp" "$LOGFILE"
+    fi
+}
+
+probe_link() {
+    local section="$1"
+    local ifname target role table fwmark
+    config_get ifname  "$section" ifname
+    config_get target  "$section" probe_target
+    config_get role    "$section" role
+
+    local state_file="$RUNDIR/$section.state"
+    local bad_file="$RUNDIR/$section.bad_count"
+    local good_file="$RUNDIR/$section.good_since"
+
+    # Read current state
+    local cur_state bad_count good_since now
+    cur_state=$(grep '^state=' "$state_file" 2>/dev/null | cut -d= -f2)
+    [ -z "$cur_state" ] && cur_state=UNKNOWN
+    bad_count=$(cat "$bad_file" 2>/dev/null || echo 0)
+    good_since=$(cat "$good_file" 2>/dev/null || echo 0)
+    now=$(date +%s)
+
+    # Ping: -q quiet, -c 3, -W 1s timeout, -I bound to interface
+    local result loss latency
+    result=$(ping -q -I "$ifname" -c 3 -W 1 "$target" 2>/dev/null)
+    loss=$(echo "$result" | grep -o '[0-9]*% packet loss' | grep -o '^[0-9]*')
+    latency=$(echo "$result" | grep -oE '[0-9]+\.[0-9]+/[0-9]+\.[0-9]+/[0-9]+\.[0-9]+' \
+              | cut -d/ -f2 | cut -d. -f1)
+    [ -z "$loss" ]    && loss=100
+    [ -z "$latency" ] && latency=9999
+
+    # Is this probe bad?
+    local is_bad=0
+    [ "$loss" -ge "$DEG_LOSS" ]   && is_bad=1
+    [ "$latency" -ge "$DEG_LAT" ] && is_bad=1
+
+    # State machine transitions
+    local new_state="$cur_state"
+    case "$cur_state" in
+        UNKNOWN|GOOD)
+            if [ "$is_bad" = 1 ]; then
+                bad_count=$((bad_count + 1))
+                good_since=0
+                if [ "$loss" = 100 ] && [ "$bad_count" -ge 2 ]; then
+                    new_state=DOWN
+                elif [ "$bad_count" -ge "$DEG_COUNT" ]; then
+                    new_state=DEGRADED
+                fi
+            else
+                bad_count=0
+                [ "$good_since" = 0 ] && good_since=$now
+                new_state=GOOD
+            fi
+            ;;
+        DEGRADED)
+            if [ "$is_bad" = 1 ]; then
+                bad_count=$((bad_count + 1))
+                good_since=0
+                [ "$loss" = 100 ] && [ "$bad_count" -ge 2 ] && new_state=DOWN
+            else
+                bad_count=0
+                [ "$good_since" = 0 ] && good_since=$now
+                if [ "$((now - good_since))" -ge "$REC_INT" ]; then
+                    new_state=GOOD
+                fi
+            fi
+            ;;
+        DOWN)
+            if [ "$is_bad" = 0 ]; then
+                bad_count=0
+                [ "$good_since" = 0 ] && good_since=$now
+                if [ "$((now - good_since))" -ge "$REC_INT" ]; then
+                    new_state=GOOD
+                fi
+            else
+                good_since=0
+            fi
+            ;;
+    esac
+
+    # Write state atomically
+    printf 'state=%s\nlatency=%d\nloss=%d\nchanged=%d\n' \
+        "$new_state" "$latency" "$loss" "$now" > "$state_file.tmp" \
+        && mv "$state_file.tmp" "$state_file"
+    echo "$bad_count"  > "$bad_file"
+    echo "$good_since" > "$good_file"
+
+    # Signal policy on transition
+    if [ "$new_state" != "$cur_state" ]; then
+        log_event "$section $cur_state -> $new_state (latency ${latency}ms, loss ${loss}%)"
+        signal_policy
+    fi
+}
+
+# Probe loop
+while true; do
+    config_load sd-wrt
+    config_foreach probe_link link
+    sleep "$INTERVAL"
+done
