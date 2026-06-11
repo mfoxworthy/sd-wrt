@@ -25,9 +25,6 @@ endef
 
 define Package/sd-wrt/description
   Probe and policy daemons for intelligent multi-WAN routing.
-  Routes interactive traffic (DNS, SSH, VoIP) to the low-latency link and
-  bulk traffic to the high-bandwidth link. Fails over automatically when
-  a link degrades. Configured via /etc/config/sd-wrt (UCI).
 endef
 
 define Package/sd-wrt/conffiles
@@ -40,18 +37,14 @@ endef
 define Package/sd-wrt/install
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) $(CURDIR)/files/etc/config/sd-wrt $(1)/etc/config/
-
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/sd-wrt-probe  $(1)/etc/init.d/
 	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/sd-wrt-policy $(1)/etc/init.d/
-
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) $(CURDIR)/files/etc/hotplug.d/iface/25-sd-wrt $(1)/etc/hotplug.d/iface/
-
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(CURDIR)/files/usr/bin/sd-wrt-probe  $(1)/usr/bin/
 	$(INSTALL_BIN) $(CURDIR)/files/usr/bin/sd-wrt-policy $(1)/usr/bin/
-
 	$(INSTALL_DIR) $(1)/usr/libexec/rpcd
 	$(INSTALL_BIN) $(CURDIR)/files/usr/libexec/rpcd/luci.sd-wrt $(1)/usr/libexec/rpcd/
 endef
