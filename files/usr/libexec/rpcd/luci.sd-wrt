@@ -37,7 +37,7 @@ case "$1" in
                 }
                 config_foreach emit_link link
 
-                local int_link="" def_link="" int_table="" def_table=""
+                int_link="" def_link="" int_table="" def_table=""
                 find_roles() {
                     local s="$1" r t
                     config_get r "$s" role
@@ -47,7 +47,7 @@ case "$1" in
                 }
                 config_foreach find_roles link
 
-                local active_int active_def
+                active_int="" active_def=""
                 active_int=$(ip rule list | grep "fwmark" | grep "lookup $int_table" | head -1)
                 if echo "$active_int" | grep -q "lookup $int_table"; then
                     active_int="$int_link"
@@ -57,7 +57,7 @@ case "$1" in
                 active_def=$(ip rule list | grep "0x02" | grep -oE 'lookup [0-9]+' | awk '{print $2}')
                 [ "$active_def" = "$int_table" ] && active_def="$int_link" || active_def="$def_link"
 
-                local events_json="" _evt_tmp
+                events_json="" _evt_tmp=""
                 if [ -f "$LOGFILE" ]; then
                     # Write to temp file so the while loop runs in the same shell
                     # (ash piped while-loops are subshells; variable assignments are lost)
