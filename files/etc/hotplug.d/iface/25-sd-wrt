@@ -27,6 +27,11 @@ config_foreach _find link
 [ -n "$matched_section" ] || exit 0
 
 if [ "$ACTION" = ifup ]; then
+    # Capture gateway before removing the default from main — policy's
+    # setup_routing_tables won't find it after we delete the route.
+    gw=$(ip route show dev "$IFNAME" | awk '/^default/{print $3; exit}')
+    [ -n "$gw" ] && echo "$gw" > "$RUNDIR/$matched_section.gw"
+
     # Remove default route from main table for non-default-role interfaces.
     # sd-wrt-policy manages dedicated tables (101/102); without this every
     # interactive link that comes up hijacks all traffic in the main table.

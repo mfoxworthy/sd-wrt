@@ -22,11 +22,12 @@ setup_routing_tables() {
         state=$(grep '^state=' "$RUNDIR/$section.state" 2>/dev/null | cut -d= -f2)
         [ "$state" = DOWN ] && return
 
-        # Get gateway from kernel routing table (works regardless of netifd interface name)
+        # Get gateway — prefer the value saved by the hotplug (captured before
+        # it removed the default from main); fall back to reading main table
+        # directly for the default-role link which is never removed from main.
         local gw
-        gw=$(ip route show dev "$ifname" | awk '/^default/{print $3; exit}')
-        # Fallback: any route on this device gives us the gateway
-        [ -z "$gw" ] && gw=$(ip route show dev "$ifname" | awk 'NR==1{print $3; exit}')
+        gw=$(cat "$RUNDIR/$section.gw" 2>/dev/null)
+        [ -z "$gw" ] && gw=$(ip route show dev "$ifname" | awk '/^default/{print $3; exit}')
         [ -z "$gw" ] && return
 
         ip route replace default via "$gw" dev "$ifname" table "$table" 2>/dev/null
