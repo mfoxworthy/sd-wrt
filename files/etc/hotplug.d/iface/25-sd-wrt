@@ -1,24 +1,54 @@
 #!/bin/sh
-# Triggered by netifd on interface up/down. INTERFACE is the netifd name (e.g. wan, cellular).
+# Triggered by netifd on interface events.
+# $INTERFACE = netifd logical name, $IFNAME = kernel device name.
 
-[ "$ACTION" = ifup ] || exit 0
+[ "$ACTION" = ifup ] || [ "$ACTION" = ifdown ] || exit 0
+
+. /lib/functions.sh
 
 RUNDIR=/var/run/sd-wrt
-state_file="$RUNDIR/$INTERFACE.state"
+mkdir -p "$RUNDIR"
 
-# Only act on interfaces we monitor
-[ -f "$state_file" ] || exit 0
+config_load sd-wrt
 
-# 1. Reset link state to UNKNOWN so probe re-evaluates immediately
-printf 'state=UNKNOWN\nlatency=0\nloss=0\nchanged=%d\n' "$(date +%s)" \
-    > "$state_file.tmp" && mv "$state_file.tmp" "$state_file"
-: > "$RUNDIR/$INTERFACE.bad_count"
-: > "$RUNDIR/$INTERFACE.good_since"
+# Find which sd-wrt section owns this kernel interface
+matched_section=""
+matched_role=""
+_find() {
+    local s="$1" ifname role
+    config_get ifname "$s" ifname
+    config_get role   "$s" role
+    [ "$ifname" = "$IFNAME" ] || return
+    matched_section="$s"
+    matched_role="$role"
+}
+config_foreach _find link
 
-# 2. Signal probe for immediate re-probe
+[ -n "$matched_section" ] || exit 0
+
+if [ "$ACTION" = ifup ]; then
+    # Remove default route from main table for non-default-role interfaces.
+    # sd-wrt-policy manages dedicated tables (101/102); without this every
+    # interactive link that comes up hijacks all traffic in the main table.
+    [ "$matched_role" != "default" ] && ip route del default dev "$IFNAME" 2>/dev/null
+
+    # Reset state so probe re-evaluates on next cycle
+    printf 'state=UNKNOWN\nlatency=0\nloss=0\nchanged=%d\n' "$(date +%s)" \
+        > "$RUNDIR/$matched_section.state.tmp" \
+        && mv "$RUNDIR/$matched_section.state.tmp" "$RUNDIR/$matched_section.state"
+    : > "$RUNDIR/$matched_section.bad_count"
+    : > "$RUNDIR/$matched_section.good_since"
+else
+    # ifdown: mark link DOWN immediately rather than waiting for probe timeout
+    printf 'state=DOWN\nlatency=9999\nloss=100\nchanged=%d\n' "$(date +%s)" \
+        > "$RUNDIR/$matched_section.state.tmp" \
+        && mv "$RUNDIR/$matched_section.state.tmp" "$RUNDIR/$matched_section.state"
+fi
+
+# Signal probe for immediate re-evaluation
 probe_pid=$(pgrep -f sd-wrt-probe | head -1)
 [ -n "$probe_pid" ] && kill -USR1 "$probe_pid" 2>/dev/null
 
-# 3. Signal policy to rebuild routing tables (netifd has the gateway)
+# Signal policy to rebuild routing tables and fwmark rules
 policy_pid=$(cat /var/run/sd-wrt-policy.pid 2>/dev/null)
 [ -n "$policy_pid" ] && kill -HUP "$policy_pid" 2>/dev/null
