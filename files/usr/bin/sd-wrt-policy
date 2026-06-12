@@ -98,7 +98,9 @@ emit_nft_rule() {
     [ "$role" = default ]     && mark_val="$DEF_MARK"
     [ -z "$mark_val" ] && return
 
-    [ -n "$proto" ]   && nft_rule="meta l4proto { $(echo $proto | tr ' ' ',') } "
+    # Restrict to LAN-originating traffic only — never mark WAN-side packets
+    nft_rule="iifname \"$LAN_BR\" "
+    [ -n "$proto" ]   && nft_rule="${nft_rule}meta l4proto { $(echo $proto | tr ' ' ',') } "
     [ -n "$dport" ]   && nft_rule="${nft_rule}th dport { $(echo $dport | tr ' ' ',') } "
     [ -n "$dest_ip" ] && nft_rule="${nft_rule}ip daddr $dest_ip "
     nft_rule="${nft_rule}mark set $mark_val"
@@ -123,14 +125,20 @@ apply_nftables() {
     INT_MARK=$(fwmark_for_role interactive)
     DEF_MARK=$(fwmark_for_role default)
 
+    # Read LAN bridge name from globals (default br-lan).
+    # All rules are restricted to this interface so that WAN-side packets
+    # (internet responses entering via wan/phy1-sta0) are never marked and
+    # never misrouted — they use the main table which has the LAN route.
+    config_get LAN_BR globals lan_bridge "br-lan"
+
     {
         echo "add table inet sd_wrt"
         echo "add set inet sd_wrt sdwrt_interactive { type ipv4_addr; flags timeout; }"
         echo "add chain inet sd_wrt prerouting { type filter hook prerouting priority mangle; policy accept; }"
         echo "flush chain inet sd_wrt prerouting"
-        echo "add rule inet sd_wrt prerouting ip daddr @sdwrt_interactive mark set $INT_MARK"
+        echo "add rule inet sd_wrt prerouting iifname \"$LAN_BR\" ip daddr @sdwrt_interactive mark set $INT_MARK"
         config_foreach emit_nft_rule rule
-        echo "add rule inet sd_wrt prerouting mark 0x00 mark set $DEF_MARK"
+        echo "add rule inet sd_wrt prerouting iifname \"$LAN_BR\" mark 0x00 mark set $DEF_MARK"
     } | nft -f -
 }
 
